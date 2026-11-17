@@ -8,25 +8,34 @@ RELOAD_DIR="${RELOAD_DIR:-/reload}"
 LIVE_DIR="${LIVE_DIR:-/etc/nginx/certs/live}"
 NGINX_BIN="${NGINX_BIN:-nginx}"
 NGINX_ARGS="${NGINX_ARGS:-}"
+NGINX_PID="${NGINX_PID:-/var/run/nginx.pid}"
 REQ="$RELOAD_DIR/REQUEST"
 RES="$RELOAD_DIR/RESULT"
 
 mkdir -p "$RELOAD_DIR"
 touch "$REQ" "$RES"
 
-# 首次启动时等待 web 侧生成证书文件
+start_nginx() {
+  # shellcheck disable=SC2086
+  $NGINX_BIN $NGINX_ARGS
+}
+
+# 启动 nginx：等待 web 侧生成证书文件；若现有文件是混搭/损坏
+# （例如断电留下的 fullchain 与 privkey 不同版本），nginx 会拒绝启动，
+# 此处持续重试，等 web 按已确认的在用版本修复 live 后再成功启动。
 n=0
-while [ ! -s "$LIVE_DIR/fullchain.pem" ] || [ ! -s "$LIVE_DIR/privkey.pem" ]; do
-  n=$((n + 1))
-  if [ "$n" -gt 600 ]; then
-    echo "reload-watcher: 等待证书文件超时" >&2
-    exit 1
+while :; do
+  if [ -s "$LIVE_DIR/fullchain.pem" ] && [ -s "$LIVE_DIR/privkey.pem" ]; then
+    if start_nginx; then
+      break
+    fi
+    n=$((n + 1))
+    if [ "$n" -eq 1 ] || [ $((n % 20)) -eq 0 ]; then
+      echo "reload-watcher: nginx 暂无法启动（第 $n 次），等待证书修复后重试" >&2
+    fi
   fi
   sleep 0.5
 done
-
-# shellcheck disable=SC2086
-$NGINX_BIN $NGINX_ARGS || exit 1
 echo "reload-watcher: nginx started, watching $REQ" >&2
 
 last_count=$(wc -l < "$REQ" | tr -d ' ')
@@ -34,7 +43,13 @@ while :; do
   sleep 0.3
   cur_count=$(wc -l < "$REQ" 2>/dev/null | tr -d ' ' || echo 0)
   case "$cur_count" in ''|*[!0-9]*) cur_count=0 ;; esac
-  [ "$cur_count" -le "$last_count" ] && continue
+  if [ "$cur_count" -le "$last_count" ]; then
+    # 空闲时巡检：master 意外退出则重新拉起（证书已不成对时重试直到修复）
+    if [ ! -f "$NGINX_PID" ] || ! kill -0 "$(cat "$NGINX_PID" 2>/dev/null)" 2>/dev/null; then
+      start_nginx || true
+    fi
+    continue
+  fi
 
   # shellcheck disable=SC2086
   if $NGINX_BIN $NGINX_ARGS -t >/tmp/nginx-t.err 2>&1; then

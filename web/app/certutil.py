@@ -53,6 +53,18 @@ def parse_pem_chain(data: bytes) -> list[x509.Certificate]:
     return certs
 
 
+def pair_matches(chain_pem: bytes | str, key_pem: bytes | str) -> bool:
+    """判断证书链叶子与私钥是否为同一对（不校验有效期/域名）。"""
+    cert_data = chain_pem.encode() if isinstance(chain_pem, str) else chain_pem
+    key_data = key_pem.encode() if isinstance(key_pem, str) else key_pem
+    try:
+        leaf = parse_pem_chain(cert_data)[0]
+        key = parse_private_key(key_data)
+    except CertError:
+        return False
+    return _pub_der(leaf.public_key()) == _pub_der(key.public_key())
+
+
 def parse_private_key(data: bytes):
     try:
         key = serialization.load_pem_private_key(data, password=None)

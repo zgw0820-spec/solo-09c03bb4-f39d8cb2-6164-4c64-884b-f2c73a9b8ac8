@@ -47,6 +47,7 @@ EOF
 start_nginx() {
   write_nginx_conf
   RELOAD_DIR="$WORK/reload" LIVE_DIR="$WORK/live" NGINX_BIN="$NGINX_BIN" \
+    NGINX_PID="$RUN/nginx.pid" \
     NGINX_ARGS="-p $NGX -c $NGX/nginx.conf" \
     nohup sh "$ROOT/nginx/reload-watcher.sh" > "$WORK/watcher.log" 2>&1 &
   echo $! > "$RUN/watcher.pid"

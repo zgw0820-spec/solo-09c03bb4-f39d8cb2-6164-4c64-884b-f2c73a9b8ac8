@@ -155,14 +155,49 @@ class RealControl:
 class CertService:
     def __init__(self, cfg: Config, control=None):
         self.cfg = cfg
-        for d in (cfg.data_dir, cfg.live_dir, cfg.reload_dir):
+        # live 目录不再直接承载文件：它是指向 versions/<版本目录> 的符号链接，
+        # 由一次 rename 原子切换，证书与私钥永远同版本成对出现。
+        self.versions_dir = os.path.join(
+            os.path.dirname(os.path.abspath(cfg.live_dir)), "versions"
+        )
+        for d in (cfg.data_dir, cfg.reload_dir, self.versions_dir):
             os.makedirs(d, exist_ok=True)
+        self._prepare_live_store()
         self.db = DB(cfg.db_path)
         self.control = control or RealControl(cfg)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._probe_cache: tuple[float, str | None] = (0.0, None)
         self._last_restore = 0.0
+        # 站点恢复中：拒绝新的启用，直到新建 TLS 握手确认在用证书可服务
+        self._recovering = False
+
+    # ------------------------------------------------------------ live 存储
+
+    def _prepare_live_store(self) -> None:
+        """把旧式 live 实目录迁移到版本化存储，为原子符号链接腾出位置。
+
+        旧目录内容（可能是混搭文件）不直接信任，改名备份后由启动对账
+        按"已确认的在用版本"重新安装。
+        """
+        os.makedirs(self.versions_dir, exist_ok=True)
+        live = self.cfg.live_dir
+        os.makedirs(os.path.dirname(os.path.abspath(live)), exist_ok=True)
+        if os.path.islink(live) or not os.path.exists(live):
+            return
+        if os.path.isdir(live):
+            backup = (
+                f"{live}.legacy-{dt.datetime.now(UTC).strftime('%Y%m%d%H%M%S')}"
+                f"-{uuid.uuid4().hex[:6]}"
+            )
+            try:
+                os.replace(live, backup)
+                log.warning("live 目录迁移：原目录已备份到 %s", backup)
+            except OSError:
+                log.exception("live 目录迁移失败，将在启动时按在用版本重建")
+                return
+        else:  # 理论上 live 不该是普通文件；移开以免阻挡符号链接
+            os.replace(live, f"{live}.legacy-file-{uuid.uuid4().hex[:6]}")
 
     # ------------------------------------------------------------ 生命周期
 
@@ -172,7 +207,7 @@ class CertService:
             empty = c.execute("SELECT COUNT(*) n FROM versions").fetchone()["n"] == 0
         if empty:
             self._seed()
-        # 上次进程退出时遗留的"启用中"操作一律转为待核实
+        # 上次进程退出时遗留的"启用中"操作一律转为待核实（不预先结案）
         with self.db.txn() as c:
             c.execute(
                 "UPDATE ops SET state='pending_verify',"
@@ -183,19 +218,74 @@ class CertService:
         served = self._probe_with_grace(self.cfg.startup_probe_timeout)
         with self.db.txn() as c:
             op = self._latest_inflight(c)
+        with self.db.txn() as c:
+            active = c.execute(
+                "SELECT v.* FROM state s JOIN versions v"
+                " ON v.id=s.active_version_id WHERE s.id=1"
+            ).fetchone()
+
+        repaired = False
         if op:
             target = self._version(op["version_id"])
             if served is not None and served == target["fingerprint"]:
                 self._finalize_success(op["seq"], note="重启后核实：新证书已生效")
-            elif served is not None:
-                self._recover_to_confirmable(served)
-                self._finalize_fail(
-                    op["seq"], "进程重启，启用结果未确认，已恢复到可确认的在用版本"
-                )
+                self._install_version(target)
             else:
-                log.warning("startup: 无法探测 Nginx，操作 #%s 保持待核实", op["seq"])
+                # 按已确认的在用版本把文件成对修复。即使探测不到 Nginx，
+                # 也必须先让 live 成为一对合法证书，Nginx 重启后才能加载。
+                base = self._version(op["base_version_id"]) or (
+                    dict(active) if active else None
+                )
+                repaired = bool(base) and self._install_version(base)
+                if repaired:
+                    # 文件被改动过：请 Nginx 按已确认版本重新加载/启动
+                    self.control.request_reload(f"startup-{uuid.uuid4().hex[:8]}")
+                    self._invalidate_probe()
+                if served is not None:
+                    self._recover_to_confirmable(served)
+                    self._finalize_fail(
+                        op["seq"], "进程重启，启用结果未确认，已恢复到可确认的在用版本"
+                    )
+                else:
+                    # 探测不到：保持待核实（不结案），文件已按在用版本成对恢复
+                    log.warning(
+                        "startup: 无法探测 Nginx，操作 #%s 保持待核实", op["seq"]
+                    )
         else:
-            self._ensure_live_matches_active(served)
+            repaired = bool(active) and self._install_version(dict(active))
+            if repaired:
+                # 文件已按在用版本成对修复，请 Nginx 重新加载
+                self.control.request_reload(f"startup-{uuid.uuid4().hex[:8]}")
+                self._invalidate_probe()
+            if served is not None and not repaired:
+                self._ensure_live_matches_active(served)
+        # 仅当启动确实修复/切换过文件时才进入"恢复中"；必须由一次新建
+        # TLS 握手确认在用版本后，才解除并重新接单。
+        self._recovering = bool(repaired) and not self._served_is_active()
+
+    def _served_is_active(self) -> bool:
+        """新建 TLS 握手是否已在服务"已确认的在用版本"。"""
+        with self.db.txn() as c:
+            row = c.execute(
+                "SELECT v.fingerprint FROM state s JOIN versions v"
+                " ON v.id=s.active_version_id WHERE s.id=1"
+            ).fetchone()
+        if not row:
+            return False
+        try:
+            return self.control.probe() == row["fingerprint"]
+        except ProbeError:
+            return False
+
+    def _maybe_clear_recovery(self) -> bool:
+        """返回站点是否仍处于恢复中；能握手确认在用证书则解除。"""
+        if not self._recovering:
+            return False
+        if self._served_is_active():
+            self._recovering = False
+            log.info("站点恢复完成：新建 TLS 握手已确认在用证书")
+            return False
+        return True
         if background:
             self._thread = threading.Thread(
                 target=self._reconcile_loop, name="reconciler", daemon=True
@@ -268,6 +358,12 @@ class CertService:
 
     def activate(self, version_id: int, base_version_id: int) -> dict:
         """提交启用。比较-交换通过后在请求线程内同步执行，结果有界。"""
+        # 恢复中拒绝新启用；但若此刻握手已确认在用证书，立即解除恢复态，
+        # 不必干等后台巡检的下一拍。
+        if self._maybe_clear_recovery():
+            raise Conflict(
+                "站点正在恢复中（尚未确认在用证书可服务），暂不接单，请稍后重试"
+            )
         with self.db.txn() as c:
             st = c.execute("SELECT * FROM state WHERE id=1").fetchone()
             if st["active_version_id"] != base_version_id:
@@ -454,33 +550,81 @@ class CertService:
                     )
                 return
             target = self._version(op["version_id"])
+            active = self._version(st["active_version_id"])
+            # 文件必须是"在用版本"的成对副本；若为混搭/缺失，则先按在用
+            # 版本成对修复，再请求重载——站点据此恢复可连接。
+            repaired = False
+            if active and not self.live_pair_ok():
+                self._repair_live_to(active)
+                repaired = True
             try:
                 served = self.control.probe()
             except ProbeError:
-                return  # 无法确认，保持待核实
+                # 新建握手仍无法探测：保持待核实，等待下一次。
+                # 若刚修复过文件，则站点仍在恢复中（拒绝新启用）。
+                if repaired:
+                    self._recovering = True
+                return
+            # 只有握手确认"在用版本"才解除恢复态；返回其它指纹不算恢复
+            if active and served == active["fingerprint"]:
+                self._recovering = False
+            elif repaired:
+                self._recovering = True
             if served == target["fingerprint"]:
                 self._finalize_success(op["seq"], note="后台核实：新证书已生效")
                 return
             created = dt.datetime.fromisoformat(op["created_at"])
             age = (dt.datetime.now(UTC) - created).total_seconds()
             if age > self.cfg.pending_ttl:
-                active = self._version(st["active_version_id"])
-                self._rollback_files(active)
+                base = self._version(op["base_version_id"]) or active
+                if base:
+                    self._rollback_files(base)
+                    # 回退写入后尚未确认可握手：先处于恢复态，待下一次
+                    # 巡检握手确认在用版本后再重新接单。
+                    self._recovering = True
                 self._finalize_fail(
                     op["seq"], "超过待核实时限仍未生效，已回退到可确认的在用版本"
                 )
             return
         # 无在途操作：保持"文件/实测/在用"三者一致（限流）
+        active = self._version(st["active_version_id"])
+        if self._recovering:
+            # 恢复期间主动、不限流地校验并修复，直到握手确认在用版本
+            self._refresh_recovery_state(active)
+            return
         if time.monotonic() - self._last_restore < self.cfg.restore_interval:
             return
         try:
             served = self.control.probe()
         except ProbeError:
             return
-        active = self._version(st["active_version_id"])
         if active and served != active["fingerprint"]:
             self._last_restore = time.monotonic()
             self._ensure_live_matches_active(served)
+
+    def _repair_live_to(self, version: dict) -> None:
+        """live 不是在用版本的成对副本时，重新成对安装并请求重载。"""
+        log.warning("live 文件缺失或证书/私钥不配对，按在用版本 #%s 成对修复", version["id"])
+        self._write_live(version)
+        self.control.request_reload(f"repair-{uuid.uuid4().hex[:8]}")
+
+    def _refresh_recovery_state(self, active: dict | None) -> None:
+        """恢复期间：确保 live 成对，握手确认在用证书后解除恢复态。"""
+        if active and not self.live_pair_ok():
+            self._repair_live_to(active)
+        try:
+            served = self.control.probe()
+        except ProbeError:
+            return  # 仍无法握手：保持恢复中
+        if active and served != active["fingerprint"]:
+            # 能连上但不是在用证书：让 Nginx 按成对的在用文件重载
+            self.control.request_reload(f"restore-{uuid.uuid4().hex[:8]}")
+            return
+        self._recovering = False
+        log.info(
+            "站点已恢复：新建 TLS 握手确认在用版本 #%s",
+            active["id"] if active else "-",
+        )
 
     # ------------------------------------------------------------ 恢复辅助
 
@@ -516,7 +660,7 @@ class CertService:
         if not active:
             return
         live_fp = self.live_fingerprint()
-        if live_fp != active["fingerprint"]:
+        if live_fp != active["fingerprint"] or not self.live_pair_ok():
             log.warning("live 文件与在用版本不一致，恢复为版本 #%s", active["id"])
             self._write_live(dict(active))
             self.control.request_reload(f"restore-{uuid.uuid4().hex[:8]}")
@@ -569,6 +713,8 @@ class CertService:
             "domain": self.cfg.site_domain,
             "served_fingerprint": served,
             "consistency": consistency,
+            "recovering": self._recovering,
+            "live_pair_ok": self.live_pair_ok(),
             "active_version_id": st["active_version_id"],
             "current_op_seq": st["current_op_seq"],
             "active": active,
@@ -595,6 +741,17 @@ class CertService:
         except (OSError, certutil.CertError):
             return None
 
+    def live_pair_ok(self) -> bool:
+        """live 中的证书与私钥是否为同一对（Nginx 能否加载的前提）。"""
+        try:
+            with open(os.path.join(self.cfg.live_dir, "fullchain.pem"), "rb") as f:
+                chain = f.read()
+            with open(os.path.join(self.cfg.live_dir, "privkey.pem"), "rb") as f:
+                key = f.read()
+        except OSError:
+            return False
+        return certutil.pair_matches(chain, key)
+
     # ------------------------------------------------------------ 内部
 
     def _version(self, vid: int) -> dict | None:
@@ -615,19 +772,98 @@ class CertService:
             " ORDER BY seq DESC LIMIT 1"
         ).fetchone()
 
+    def _install_version(self, version: dict | None) -> bool:
+        """把某版本的证书与私钥成对安装为 live。
+
+        返回是否实际改动了 live（用于判断站点是否处于恢复态）。
+        """
+        if not version:
+            return False
+        if self.live_fingerprint() == version["fingerprint"] and self.live_pair_ok():
+            return False
+        self._write_live(version)
+        return True
+
     def _write_live(self, version: dict) -> None:
-        """原子写入 live 证书文件（先写临时文件再 rename）。"""
-        for name, content in (
-            ("fullchain.pem", version["cert_pem"]),
-            ("privkey.pem", version["key_pem"]),
-        ):
-            tmp = os.path.join(self.cfg.live_dir, f".{name}.tmp")
-            dst = os.path.join(self.cfg.live_dir, name)
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write(content)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, dst)
+        """将证书与私钥作为同一版本成对安装，供 Nginx 原子加载。
+
+        每次安装都新建一个**不可变**版本目录
+        versions/v<id>-<指纹前缀>-<随机后缀>/，两个文件都落稳并 fsync 后，
+        用一次 rename 把 live 符号链接指向它。不原地改写已被 Nginx
+        引用的目录，因此任何时刻 live 下的两个文件都来自同一版本，
+        断电也不会出现混搭。
+        """
+        base = f"v{version['id']}-{version['fingerprint'][:12]}"
+        vdir = os.path.join(self.versions_dir, f"{base}-{uuid.uuid4().hex[:8]}")
+        os.makedirs(vdir)
+        staged: list[tuple[str, str]] = []
+        try:
+            for name, content in (
+                ("fullchain.pem", version["cert_pem"]),
+                ("privkey.pem", version["key_pem"]),
+            ):
+                dst = os.path.join(vdir, name)
+                tmp = os.path.join(vdir, f".{name}.tmp")
+                # 私钥 0600、证书 0644；umask 不应放宽私钥权限
+                mode = 0o600 if name == "privkey.pem" else 0o644
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    os.fchmod(f.fileno(), mode)
+                    f.write(content)
+                    f.flush()
+                    os.fsync(f.fileno())
+                staged.append((tmp, dst))
+            for tmp, dst in staged:
+                os.replace(tmp, dst)
+            self._fsync_dir(vdir)
+        finally:
+            for tmp, _ in staged:
+                try:
+                    os.unlink(tmp)
+                except FileNotFoundError:
+                    pass
+
+        # 原子切换 live 符号链接到本版本目录（一次 rename，不含两步）。
+        # 必须用相对目标：同一证书卷在 web 挂到 /certs、在 nginx 挂到
+        # /etc/nginx/certs，绝对路径在两侧不一致。live 链接与 versions/
+        # 同处卷根，故链接目标写作 "versions/<版本目录>"。
+        link_target = os.path.join("versions", os.path.basename(vdir))
+        live = self.cfg.live_dir
+        tmp_link = f"{live}.switch-{uuid.uuid4().hex[:8]}"
+        try:
+            os.symlink(link_target, tmp_link)
+        except FileExistsError:
+            os.unlink(tmp_link)
+            os.symlink(link_target, tmp_link)
+        try:
+            os.replace(tmp_link, live)
+        except OSError:
+            # live 仍是实目录（未迁移成功）：移开后重试一次
+            try:
+                os.unlink(tmp_link)
+            except FileNotFoundError:
+                pass
+            if os.path.isdir(live) and not os.path.islink(live):
+                backup = f"{live}.legacy-{uuid.uuid4().hex[:8]}"
+                os.replace(live, backup)
+                log.warning("live 目录被移开为 %s，改用版本目录符号链接", backup)
+            os.symlink(link_target, tmp_link)
+            os.replace(tmp_link, live)
+        self._fsync_dir(os.path.dirname(os.path.abspath(live)))
+
+    @staticmethod
+    def _fsync_dir(path: str) -> None:
+        """持久化 rename 本身，降低断电后目录项未落盘的风险。"""
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
 
     def _probe_with_grace(self, timeout: float) -> str | None:
         deadline = time.monotonic() + timeout

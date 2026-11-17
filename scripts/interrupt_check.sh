@@ -74,6 +74,47 @@ sleep 2
 [ "$(live_fp)" = "$V3FP" ] && ok "C: live 文件已恢复为在用版本" || bad "C: live 文件未恢复"
 [ "$(served_fp)" = "$V3FP" ] && ok "C: 实测指纹恢复为在用版本" || bad "C: 实测指纹" "served=$(served_fp)"
 
+echo "=== 场景 D：断电留下混搭 live 目录，Web 与 Nginx 一起重启 ==="
+# 模拟事故现场：live 是实目录（旧部署形态），fullchain 已被换成新证书，
+# privkey 仍是已确认在用的旧私钥 —— nginx 会因 "key values mismatch" 拒绝启动。
+mkcert /tmp/ic-d
+V3KEY_BACKUP=$(mktemp)
+openssl pkey -in "$WORK/live/privkey.pem" -out "$V3KEY_BACKUP" 2>/dev/null
+$STACK down >/dev/null 2>&1
+rm -f "$WORK/live"
+mkdir -p "$WORK/live"
+cp /tmp/ic-d/chain.pem "$WORK/live/fullchain.pem"
+cp "$V3KEY_BACKUP" "$WORK/live/privkey.pem"
+rm -f "$V3KEY_BACKUP"
+# 先确认这确实是一个 nginx 无法加载的混搭状态
+if "${NGINX_BIN:-nginx}" -p "$WORK/nginx" -c "$WORK/nginx/nginx.conf" -t >/dev/null 2>&1; then
+  bad "D: 前置" "混搭文件竟通过 nginx -t"
+else
+  ok "D: 前置：混搭文件确实令 nginx -t 失败"
+fi
+# 整栈重启：watcher 会等 web 按已确认在用版本修复文件后才成功启动 nginx
+$STACK up >/dev/null 2>&1 || { bad "D: 整栈重启失败"; }
+for i in $(seq 1 60); do [ "$(served_fp)" = "$V3FP" ] && break; sleep 0.5; done
+# /api/status 的实测指纹有 2s 缓存，轮询到一致性收敛（或超时）
+for i in $(seq 1 40); do
+  ST=$(curl -s $WEB/api/status)
+  CONS=$(echo "$ST" | jqv "d['consistency']")
+  [ "$CONS" = "match" ] && break
+  sleep 0.5
+done
+ACTIVE=$(echo "$ST" | jqv "d['active_version_id']")
+PAIROK=$(echo "$ST" | jqv "d['live_pair_ok']")
+[ "$ACTIVE" = "$V3" ] && ok "D: 在用版本仍为已确认的 #$V3" || bad "D: 在用版本" "active=$ACTIVE want=$V3"
+[ "$PAIROK" = "True" ] && ok "D: live 已恢复为成对证书" || bad "D: live 不成对"
+[ -L "$WORK/live" ] && ok "D: live 已改为原子符号链接" || bad "D: live 非符号链接"
+[ "$(served_fp)" = "$V3FP" ] && ok "D: 站点恢复可连接，握手为已确认在用证书" || bad "D: 站点不可用/指纹不符" "served=$(served_fp)"
+[ "$CONS" = "match" ] && ok "D: 一致性为 match" || bad "D: 一致性" "cons=$CONS"
+# 恢复完成后应可重新接单
+mkcert /tmp/ic-d2; V5=$(upload /tmp/ic-d2)
+CODE=$(curl -s -o /tmp/ic-d2.json -w '%{http_code}' -F "version_id=$V5" -F "base_version_id=$V3" "$WEB/activate")
+D2STATE=$(jqv "d['op']['state']" < /tmp/ic-d2.json)
+[ "$CODE" = "200" ] && [ "$D2STATE" = "succeeded" ] && ok "D: 恢复后重新接单成功" || bad "D: 重新接单" "code=$CODE state=$D2STATE"
+
 echo ""
 echo "== interrupt: $PASS passed, $FAIL failed =="
 $STACK down >/dev/null 2>&1

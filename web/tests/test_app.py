@@ -6,6 +6,7 @@ FakeControl 模拟 nginx 行为：收到重载回执为 ok 时，
 from __future__ import annotations
 
 import datetime as dt
+import os
 import threading
 
 import pytest
@@ -411,3 +412,163 @@ def test_reconciler_restores_out_of_band_change(service):
     time.sleep(0.15)  # restore_interval = 0.1
     service.reconcile_once()
     assert service.control.reload_count >= 1
+
+
+# ------------------------------------------------------- 断电混搭 / 成对加载
+
+
+def _corrupt_live_to_mixed_pair(cfg, svc):
+    """模拟断电：fullchain 被换成另一版本，privkey 仍是旧版本。"""
+    other_chain, _ = make_cert(svc)
+    with open(f"{cfg.live_dir}/fullchain.pem", "wb") as f:
+        f.write(other_chain)
+    # 确保确实是两种不同版本的混搭
+    assert not svc.live_pair_ok()
+
+
+def test_live_installed_as_matched_pair(service):
+    v2 = upload_new(service)
+    assert service.activate(v2["id"], base_version_id=1)["state"] == "succeeded"
+    assert service.live_pair_ok()
+    assert service.live_fingerprint() == v2["fingerprint"]
+
+
+def test_mixed_pair_detected_before_nginx_load(cfg):
+    svc = CertService(cfg)
+    svc.control = FakeControl(svc)
+    svc.startup(background=False)
+    _corrupt_live_to_mixed_pair(cfg, svc)
+    assert not svc.live_pair_ok()
+    svc.shutdown()
+
+
+def test_restart_repairs_mixed_pair_to_active_version(cfg):
+    """断电留下混搭文件：重启后按已确认在用版本成对恢复，Nginx 可加载。"""
+    svc = CertService(cfg)
+    svc.control = FakeControl(svc)
+    svc.startup(background=False)
+    v2 = upload_new(svc)
+    svc.activate(v2["id"], base_version_id=1)
+    active_fp = svc.status(probe=False)["active"]["fingerprint"]
+    _corrupt_live_to_mixed_pair(cfg, svc)          # 断电后的混搭状态
+    svc.shutdown()
+
+    svc2 = restart(cfg)
+    svc2.control.probe_error = True                 # Nginx 尚未启动，探测失败
+    svc2.startup(background=False)
+    # 即便无法探测，也必须先把文件恢复成一对合法证书
+    assert svc2.live_pair_ok()
+    assert svc2.live_fingerprint() == active_fp
+    # 探测失败 -> 站点恢复中，拒绝新启用
+    assert svc2.status(probe=False)["recovering"] is True
+    v3 = upload_new(svc2)
+    with pytest.raises(Conflict, match="恢复"):
+        svc2.activate(v3["id"], base_version_id=v2["id"])
+    # Nginx 起来并能握手到在用证书后，解除恢复态并重新接单
+    svc2.control.probe_error = False
+    svc2.control.served = active_fp
+    op = svc2.activate(v3["id"], base_version_id=v2["id"])
+    assert op["state"] == "succeeded"
+    assert svc2.status(probe=False)["recovering"] is False
+    svc2.shutdown()
+
+
+def test_recovery_not_cleared_by_unknown_certificate(cfg):
+    """握手返回未登记证书时不得解除恢复态。"""
+    cfg.pending_ttl = 100.0
+    svc = CertService(cfg)
+    svc.control = FakeControl(svc)
+    svc.startup(background=False)
+    active_fp = svc.status(probe=False)["active"]["fingerprint"]
+    _corrupt_live_to_mixed_pair(cfg, svc)
+    svc.shutdown()
+
+    svc2 = restart(cfg)
+    svc2.control.probe_error = True
+    svc2.startup(background=False)
+    assert svc2.status(probe=False)["recovering"] is True
+    svc2.control.probe_error = False
+    svc2.control.served = "f" * 64          # 未登记指纹
+    svc2.reconcile_once()
+    assert svc2.status(probe=False)["recovering"] is True
+    svc2.control.served = active_fp         # 已确认在用证书
+    svc2.reconcile_once()
+    assert svc2.status(probe=False)["recovering"] is False
+    svc2.shutdown()
+
+
+def test_pending_stays_pending_while_unprobeable(cfg):
+    """无法新建 TLS 握手时，待核实不得结案。"""
+    svc = CertService(cfg)
+    svc.control = FakeControl(svc)
+    svc.startup(background=False)
+    v2 = upload_new(svc)
+    old_fp = svc.status(probe=False)["active"]["fingerprint"]
+    svc.control.receipt_mode = "timeout"
+    op = svc.activate(v2["id"], base_version_id=1)
+    assert op["state"] == "pending_verify"
+    svc.control.probe_error = True
+    for _ in range(5):
+        svc.reconcile_once()
+    assert svc.get_op(op["seq"])["state"] == "pending_verify"
+    svc.control.probe_error = False
+    svc.control.served = old_fp
+    svc.shutdown()
+
+
+def test_pending_concludes_only_after_handshake_confirms(cfg):
+    """待核实只在握手确认"已登记的实际在用证书"后结案为成功。"""
+    cfg.pending_ttl = 100.0  # 放大宽限期，专测判定逻辑
+    svc = CertService(cfg)
+    svc.control = FakeControl(svc)
+    svc.startup(background=False)
+    v2 = upload_new(svc)
+    svc.control.receipt_mode = "timeout"
+    op = svc.activate(v2["id"], base_version_id=1)
+    assert op["state"] == "pending_verify"
+    # 握手返回未登记指纹：不得结案为成功（宽限期内仍保持待核实）
+    svc.control.served = "f" * 64
+    svc.reconcile_once()
+    assert svc.get_op(op["seq"])["state"] == "pending_verify"
+    # 握手确认为已登记的目标版本 -> 结案成功
+    svc.control.served = v2["fingerprint"]
+    svc.reconcile_once()
+    assert svc.get_op(op["seq"])["state"] == "succeeded"
+    assert svc.status(probe=False)["active_version_id"] == v2["id"]
+    svc.shutdown()
+
+
+def test_unknown_served_fingerprint_never_marked_succeeded(cfg):
+    """超时后握手仍返回未登记指纹：只能回退，绝不标记成功。"""
+    svc = CertService(cfg)
+    svc.control = FakeControl(svc)
+    svc.startup(background=False)
+    v2 = upload_new(svc)
+    svc.control.receipt_mode = "timeout"
+    op = svc.activate(v2["id"], base_version_id=1)
+    svc.control.served = "f" * 64
+    import time
+
+    time.sleep(0.6)  # 超过 pending_ttl=0.5
+    svc.reconcile_once()
+    assert svc.get_op(op["seq"])["state"] == "failed"
+    assert svc.status(probe=False)["active_version_id"] == 1
+    svc.shutdown()
+
+
+def test_repeated_install_uses_fresh_immutable_dir(service):
+    """重复安装同一版本不得原地改写被引用的目录，而是新建目录再切链。"""
+    v2 = upload_new(service)
+    service.activate(v2["id"], base_version_id=1)
+    link1 = os.readlink(service.cfg.live_dir)
+    first_dir = os.path.realpath(service.cfg.live_dir)
+    fp_before = service.live_fingerprint()
+    # 再次安装（例如恢复/修复路径触发）
+    service._write_live(service._version(v2["id"]))
+    link2 = os.readlink(service.cfg.live_dir)
+    second_dir = os.path.realpath(service.cfg.live_dir)
+    assert link1 != link2 and first_dir != second_dir
+    assert service.live_fingerprint() == fp_before
+    assert service.live_pair_ok()
+    # 旧目录仍在（未被就地改写），内容依旧成对
+    assert os.path.exists(os.path.join(first_dir, "fullchain.pem"))

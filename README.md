@@ -42,22 +42,31 @@ docker compose up --build
 | 上传校验 | `certutil.validate_upload`：密钥匹配（公钥 DER 对比）、域名（SAN/CN，含单层通配）、有效期、链逐级签发验证 |
 | 页面所见版号 | 启用表单携带 `base_version_id`；`BEGIN IMMEDIATE` 事务内比较-交换，不一致即 409「页面版号已过期」 |
 | 并发/重复提交 | 同一事务内拒绝已存在 `activating` 操作；重复提交因版号失效被拒；上传按指纹去重 |
-| 启用成功判据 | 仅当新建 TLS 连接返回新证书指纹才置 `succeeded` |
+| **证书/私钥同版本加载** | live 不再是两个独立文件：每次安装新建一个**不可变**版本目录 `versions/v<id>-<指纹前缀>-<随机>/`，两个文件落稳后，一次 `rename` 把 `live` 符号链接指向它。Nginx 读到的 `fullchain.pem` 与 `privkey.pem` 永远来自同一版本目录，断电不会出现混搭 |
+| **混搭文件自愈** | 启动时 `_prepare_live_store` 把旧式实目录改名备份；`live_pair_ok` 用公钥配对校验发现不配对，随即按**已确认的在用版本**成对重建并请求重载。Nginx 侧 watcher 在无法加载时持续重试，待文件修复后自动启动，站点恢复可连接 |
+| 启用成功判据 | 仅当新建 TLS 连接返回**已登记**的新证书指纹才置 `succeeded` |
 | 重载失败 | 回执 `fail` → 文件回滚为旧证书并保持旧版本在用 |
-| 回执不明/重启 | 操作置 `pending_verify`（页面显示"待核实"）；后台核实循环确认或超时回退；进程重启时按 Nginx 实际服务指纹对账，恢复到可确认的在用版本 |
+| 回执不明/重启 | 操作置 `pending_verify`（页面显示"待核实"）；**无法探测时保持待核实不结案**；后台核实循环仅在一次新建 TLS 握手确认已登记在用证书后才结案，超时才回退 |
+| **恢复期间暂停接单** | 站点处于恢复态（文件被重建且尚未握手确认）时，`activate` 返回 409；一旦握手确认在用证书即自动解除并重新接单 |
 | 旧操作不覆盖新提交 | 任何落库/写文件前检查 `current_op_seq`；新操作创建时把待核实旧操作置 `superseded` |
 | 已有连接 | nginx 平滑重载，旧 worker 服务完旧连接再退出 |
 
 ## 验证
 
 ```bash
-cd web && python3 -m pytest tests/ -q          # 24 项单元/集成测试
+cd web && python3 -m pytest tests/ -q          # 31 项单元/集成测试
 bash scripts/local_stack.sh up && python3 scripts/e2e_check.py   # 19 项真实端到端
-bash scripts/interrupt_check.sh                # 10 项崩溃/中断恢复实测
+bash scripts/interrupt_check.sh                # 17 项崩溃/中断/断电恢复实测
 ```
+
+`interrupt_check.sh` 场景 D 复现本次故障：把 live 恢复成"新证书 + 旧私钥"
+的实目录（`nginx -t` 会因 key values mismatch 失败），再整栈重启，
+验证 Web 与 Nginx 均能凭已确认的在用版本恢复出可连接站点并重新接单。
 
 ## 说明与限制
 
 - 单实例管理进程（SQLite + 进程内锁），不适用于多副本部署。
 - 演示用 CA 私钥存于数据目录 `ca/`，仅为签发演示证书；生产应上传外部签发证书。
 - nginx 与 web 之间经共享卷文件通信，回执超时（默认 6s）即视为"回执不明"。
+- live 卷中会保留各历史版本的 `versions/` 目录（便于追溯与原子切换），
+  不自动清理；如磁盘敏感可定期清理非在用版本目录。

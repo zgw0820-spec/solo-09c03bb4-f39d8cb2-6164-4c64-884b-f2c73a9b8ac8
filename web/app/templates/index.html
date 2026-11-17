@@ -39,10 +39,14 @@
      域名：{{ st.active.san }} ｜ 有效期：{{ st.active.not_before[:10] }} ~ {{ st.active.not_after[:10] }}</p>
   {% else %}<p class="bad">无在用版本</p>{% endif %}
   <p>启用状态：
-    {% if st.latest_op and st.latest_op.state == 'activating' %}
+    {% if st.recovering %}
+      <span class="warn">站点恢复中 —— 证书/私钥已按在用版本成对重建，等待新建 TLS 握手确认；期间暂不接单</span>
+    {% elif st.latest_op and st.latest_op.state == 'activating' %}
       <span class="warn">启用进行中（操作 #{{ st.latest_op.seq }}）…</span>
     {% elif st.latest_op and st.latest_op.state == 'pending_verify' %}
       <span class="warn">待核实（操作 #{{ st.latest_op.seq }}）：{{ st.latest_op.detail }}</span>
+    {% elif not st.live_pair_ok %}
+      <span class="warn">待核实 —— live 证书与私钥不配对，系统将按在用版本修复</span>
     {% elif st.consistency == 'match' %}
       <span class="ok">正常 —— 实测指纹与在用版本一致</span>
     {% elif st.consistency == 'unknown' %}
