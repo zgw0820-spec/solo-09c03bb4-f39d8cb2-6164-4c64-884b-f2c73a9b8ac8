@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="5">
+<title>证书启用管理 · {{ st.domain }}</title>
+<style>
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 2rem auto; max-width: 960px; color: #222; }
+  h1 { font-size: 1.4rem; } h2 { font-size: 1.1rem; margin-top: 2rem; }
+  .card { border: 1px solid #ddd; border-radius: 8px; padding: 1rem 1.2rem; margin: 1rem 0; }
+  .ok   { color: #0a7d2c; font-weight: 600; }
+  .warn { color: #b26a00; font-weight: 600; }
+  .bad  { color: #b00020; font-weight: 600; }
+  code { background: #f4f4f4; padding: 1px 5px; border-radius: 4px;
+         word-break: break-all; font-size: .85rem; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+  th, td { border: 1px solid #e0e0e0; padding: 6px 8px; text-align: left; }
+  th { background: #fafafa; }
+  .banner { padding: .6rem 1rem; border-radius: 6px; margin: .8rem 0; }
+  .banner.msg { background: #e7f6ea; } .banner.err { background: #fdecea; }
+  .muted { color: #777; font-size: .85rem; }
+  button { padding: 4px 14px; cursor: pointer; }
+</style>
+</head>
+<body>
+<h1>证书启用管理 · 站点 <code>{{ st.domain }}</code></h1>
+
+{% if msg %}<div class="banner msg">{{ msg }}</div>{% endif %}
+{% if err %}<div class="banner err">{{ err }}</div>{% endif %}
+
+<div class="card">
+  <h2>当前状态</h2>
+  <p>Nginx 实测指纹（新建 TLS 连接）：
+    {% if st.served_fingerprint %}<code>{{ st.served_fingerprint }}</code>
+    {% else %}<span class="warn">无法连接 Nginx，待核实</span>{% endif %}</p>
+  {% if st.active %}
+  <p>在用版本：#{{ st.active.id }}（指纹 <code>{{ st.active.fingerprint }}</code>）<br>
+     域名：{{ st.active.san }} ｜ 有效期：{{ st.active.not_before[:10] }} ~ {{ st.active.not_after[:10] }}</p>
+  {% else %}<p class="bad">无在用版本</p>{% endif %}
+  <p>启用状态：
+    {% if st.latest_op and st.latest_op.state == 'activating' %}
+      <span class="warn">启用进行中（操作 #{{ st.latest_op.seq }}）…</span>
+    {% elif st.latest_op and st.latest_op.state == 'pending_verify' %}
+      <span class="warn">待核实（操作 #{{ st.latest_op.seq }}）：{{ st.latest_op.detail }}</span>
+    {% elif st.consistency == 'match' %}
+      <span class="ok">正常 —— 实测指纹与在用版本一致</span>
+    {% elif st.consistency == 'unknown' %}
+      <span class="warn">待核实 —— 暂时无法探测 Nginx</span>
+    {% else %}
+      <span class="warn">待核实 —— 实测指纹与在用版本不一致，系统将自动恢复</span>
+    {% endif %}
+  </p>
+  {% if st.latest_op %}
+  <p class="muted">最近操作 #{{ st.latest_op.seq }}：目标版本 #{{ st.latest_op.version_id }}，
+     状态 {{ st.latest_op.state }}，{{ st.latest_op.updated_at }}
+     {% if st.latest_op.detail %}｜ {{ st.latest_op.detail }}{% endif %}</p>
+  {% endif %}
+</div>
+
+<h2>证书版本</h2>
+<table>
+  <tr><th>版本</th><th>指纹 (SHA-256)</th><th>有效期至</th><th>状态</th><th>操作</th></tr>
+  {% for v in st.versions %}
+  <tr>
+    <td>#{{ v.id }}</td>
+    <td><code>{{ v.fingerprint[:32] }}…</code></td>
+    <td>{{ v.not_after[:10] }}</td>
+    <td>{{ {'active':'在用','candidate':'候选','superseded':'已被替换','failed':'启用失败'}[v.status] }}</td>
+    <td>
+      {% if v.status != 'active' %}
+      <form method="post" action="/activate" style="display:inline">
+        <input type="hidden" name="version_id" value="{{ v.id }}">
+        <input type="hidden" name="base_version_id" value="{{ st.active_version_id }}">
+        <input type="hidden" name="redirect" value="1">
+        <button type="submit">启用（基于在用版号 #{{ st.active_version_id }}）</button>
+      </form>
+      {% else %}—{% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+<p class="muted">启用按钮携带本页渲染时的在用版号；若页面已过期，提交将被拒绝且不影响在用证书。</p>
+
+<h2>上传新证书</h2>
+<div class="card">
+  <form method="post" action="/upload" enctype="multipart/form-data">
+    <p>PEM 证书链（叶子证书在前）：<input type="file" name="cert_file" required></p>
+    <p>PEM 私钥（未加密）：<input type="file" name="key_file" required></p>
+    <input type="hidden" name="redirect" value="1">
+    <button type="submit">校验并登记</button>
+  </form>
+  <p class="muted">上传时校验：密钥匹配、域名覆盖 {{ st.domain }}、有效期、链完整性。</p>
+</div>
+
+<p class="muted">页面每 5 秒自动刷新。已有 TLS 连接不受重载影响，可自然完成。</p>
+</body>
+</html>

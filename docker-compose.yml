@@ -1,0 +1,32 @@
+services:
+  web:
+    build: ./web
+    environment:
+      SITE_DOMAIN: demo.internal
+      DATA_DIR: /data
+      LIVE_DIR: /certs/live
+      RELOAD_DIR: /reload
+      NGINX_PROBE_HOST: nginx
+      NGINX_PROBE_PORT: "443"
+    volumes:
+      - webdata:/data
+      - certs:/certs
+      - reload:/reload
+    ports:
+      - "8080:8000"     # 管理页
+    depends_on:
+      - nginx
+
+  nginx:
+    build: ./nginx
+    volumes:
+      - certs:/etc/nginx/certs
+      - reload:/reload
+    ports:
+      - "8443:443"      # 内网站点 TLS
+      - "8081:80"
+
+volumes:
+  webdata:
+  certs:
+  reload:
